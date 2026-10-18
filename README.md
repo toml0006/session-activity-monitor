@@ -34,13 +34,13 @@ stops all sampling, so the mod runs nothing until you call it again.
 At the prompt of a Claude Code terminal session:
 
 ```
-/plugin install session-stats --marketplace toml0006/claude-session-stats
+/plugin install session-stats --marketplace toml0006/session-activity-monitor
 ```
 
 Answer `y` to add the marketplace, then pick a scope. From a shell:
 
 ```
-claude plugin install session-stats --marketplace toml0006/claude-session-stats
+claude plugin install session-stats --marketplace toml0006/session-activity-monitor
 ```
 
 ## Limits
