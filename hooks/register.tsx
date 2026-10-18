@@ -1,12 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Io, Stats, Turn } from '../types'
+import type { Io, Mode, Snapshot, Stats, Turn } from '../types'
 import type { Counters } from './stats'
 import {
   BATTERY_PROBE,
   NET_PROBE,
   PROBE,
+  SLIM_PROBE,
   bytes,
   gb,
   ioProbe,
@@ -15,13 +16,21 @@ import {
   parseNettop,
   parseProbe,
   parseRusage,
+  parseSlim,
   parseTimes,
   rates,
   sparkline,
 } from './stats'
 
 const PANE = 'session-stats'
-const PERIOD_MS = 2000
+// What each mode costs, measured on an M-series Mac: the full ps is ~86 ms of CPU,
+// the nameless one ~44 ms, the python energy probe ~55 ms, nettop ~128 ms
+const MODES: Record<Mode, { ms: number; note: string }> = {
+  lite: { ms: 10000, note: 'every 10 s, CPU and RAM only, about 0.4% of one core' },
+  normal: { ms: 5000, note: 'every 5 s, with live energy and disk, about 3% of one core' },
+  full: { ms: 2000, note: 'every 2 s, everything, about 7% of one core (plus nettop with the pane open)' },
+}
+const MODE_KEY = 'mode'
 const HISTORY = 120
 // Each history in the bar is at most this many cells (one minute of samples)
 const BAR_SPAN = 30
@@ -49,6 +58,7 @@ const EMPTY: Stats = {
 }
 const stats = atom({ plugin: 'session-stats', key: 'stats' } as const, EMPTY)
 const isBarOn = atom({ plugin: 'session-stats', key: 'isBarOn' } as const, false)
+const modeAtom = atom({ plugin: 'session-stats', key: 'mode' } as const, 'lite' as Mode)
 
 const batteryShare = (j: number, wh: number) => `${((j / (wh * 3600)) * 100).toFixed(j / (wh * 3600) >= 0.01 ? 1 : 2)}%`
 
@@ -64,6 +74,14 @@ let timer: Timer | undefined
 let isPaneOpen = false
 let isTurnRunning = false
 let prevSampleAt: number | undefined
+let timerMs = 0
+let mode: Mode = 'lite'
+// When this session last drew the bar: a session that doesn't draw it (a
+// background spare, no surface attached) has no reason to sample for it
+let lastBarDrawnAt: number | undefined
+
+// The pane shows everything, so it samples at full while it's open
+const effectiveMode = (): Mode => (isPaneOpen ? 'full' : mode)
 
 // The previous cumulative counters, to turn the next ones into rates
 let prevRusage: { at: number; counters: Counters } | undefined
@@ -90,8 +108,17 @@ function promptSummary(st: Stats): string {
   return `${st.turn ? 'running' : 'last'} ${duration(t.seconds)} · ${joules(t.joules)}${battery} · ${t.cpuSeconds.toFixed(0)} CPU-s · peak ${(t.peakCpu / 100).toFixed(1)} cores`
 }
 
-async function sample($: EngineInterface) {
+// A periodic tick: skipped when only an undrawn bar wants it, the nameless ps
+// in lite, the full probe otherwise. `force` (a prompt's start and end, the
+// sampler starting) always takes a full reading with energy.
+async function sample($: EngineInterface, force = false) {
   try {
+    const now = await $.clock.now()
+    const isBarUnseen = lastBarDrawnAt === undefined || now - lastBarDrawnAt > 3 * MODES[effectiveMode()].ms + 2000
+    if (!force && !isPaneOpen && !isTurnRunning && isBarUnseen) return
+    const { snapshot } = await readStats($)
+    if (!force && effectiveMode() === 'lite' && snapshot && (await sampleSlim($, snapshot))) return
+
     const ps = await $.process.run(PROBE, { env: { LC_ALL: 'C' }, timeoutMs: 5000 })
     const snap = parseProbe(ps.stdout)
     const pids = snap.procs.map(p => p.pid)
@@ -149,10 +176,40 @@ async function sample($: EngineInterface) {
         ownSince: s.ownSince ?? at,
       }
     })
-    if (!isNetBusy) void sampleNet($, pids)
+    if (isPaneOpen && !isNetBusy) void sampleNet($, pids)
   } catch (err) {
     await updateStats($, s => ({ ...s, error: String(err) }))
   }
+}
+
+// Lite: CPU and RAM of the tree under the known root, nothing else. False when
+// the root is gone, so the caller takes a full reading instead.
+async function sampleSlim($: EngineInterface, snap: Snapshot): Promise<boolean> {
+  const { stdout } = await $.process.run(SLIM_PROBE, { env: { LC_ALL: 'C' }, timeoutMs: 5000 })
+  const tree = parseSlim(stdout, snap.rootPid)
+  if (!tree) return false
+  const at = await $.clock.now()
+  const sinceLast = prevSampleAt === undefined ? 0 : (at - prevSampleAt) / 1000
+  prevSampleAt = at
+  const cpuDelta = (tree.cpu / 100) * sinceLast
+  const own = parseTimes(stdout)
+  await updateStats($, s => ({
+    ...s,
+    snapshot: s.snapshot && { ...s.snapshot, cpu: tree.cpu, rssKb: tree.rssKb },
+    error: null,
+    cpuHistory: push(s.cpuHistory, tree.cpu),
+    ramHistory: push(s.ramHistory, tree.rssKb),
+    cpuSeconds: s.cpuSeconds + cpuDelta,
+    turn: s.turn && {
+      ...s.turn,
+      seconds: (at - s.turn.startedAt) / 1000,
+      cpuSeconds: s.turn.cpuSeconds + cpuDelta,
+      peakCpu: Math.max(s.turn.peakCpu, tree.cpu),
+    },
+    ownCpuSeconds: s.ownCpuSeconds + own,
+    ownSince: s.ownSince ?? at,
+  }))
+  return true
 }
 
 async function sampleNet($: EngineInterface, pids: readonly number[]) {
@@ -178,9 +235,15 @@ async function sampleNet($: EngineInterface, pids: readonly number[]) {
 
 async function syncSampler($: EngineInterface) {
   const isNeeded = isPaneOpen || isTurnRunning || (await read($, isBarOn))
+  const ms = MODES[effectiveMode()].ms
+  if (isNeeded && timer && timerMs !== ms) {
+    timer.cancel()
+    timer = undefined
+  }
   if (isNeeded && !timer) {
-    await sample($)
-    timer = $.clock.every(PERIOD_MS, () => void sample($))
+    await sample($, true)
+    timer = $.clock.every(ms, () => void sample($))
+    timerMs = ms
   } else if (!isNeeded && timer) {
     timer.cancel()
     timer = undefined
@@ -212,11 +275,15 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'session-stats',
-      description: 'Show live CPU, RAM and processes of this session; "bar" toggles the strip above the prompt, "stop" shuts everything off',
-      argumentHint: '[bar [on|off] | stop]',
+      description:
+        'Show live CPU, RAM and processes of this session; "bar" toggles the strip above the prompt, "mode" sets how much the monitor itself costs, "stop" shuts everything off',
+      argumentHint: '[bar [on|off] | mode [lite|normal|full] | stop]',
     })
     const isOn = (await $.store.get(BAR_KEY)) === true
     await update($, isBarOn, () => isOn)
+    const stored = await $.store.get(MODE_KEY)
+    mode = stored === 'normal' || stored === 'full' ? stored : 'lite'
+    await update($, modeAtom, () => mode)
     const batteryWh = await $.process
       .run(BATTERY_PROBE, { timeoutMs: 5000 })
       .then(r => parseBattery(r.stdout))
@@ -233,16 +300,20 @@ export const register: Register = on => {
 
   // A prompt's cost: sample from its submit to its turn's end, whatever is showing
   on('prompt.submit', async ($, e, next) => {
+    // A full reading first is the prompt's baseline, so earlier energy isn't counted
+    isTurnRunning = true
+    if (timer) await sample($, true)
+    await syncSampler($)
     const startedAt = await $.clock.now()
     await updateStats($, s => ({ ...s, turn: { startedAt, seconds: 0, joules: 0, cpuSeconds: 0, peakCpu: 0 } }))
-    isTurnRunning = true
-    await syncSampler($)
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     // A subagent's turn ends inside the prompt's; only the main loop's ends it
     if (e.agentId !== undefined) return next(e)
+    // A full reading at the end, so even lite counts the prompt's whole energy
+    await sample($, true)
     const { turn, batteryWh } = await readStats($)
     isTurnRunning = false
     if (turn) {
@@ -260,6 +331,16 @@ export const register: Register = on => {
   on('command.run', { command: 'session-stats' }, async ($, e) => {
     const [sub, arg] = e.args.trim().split(/\s+/)
     if (sub === 'stop' || sub === 'off' || sub === 'kill') return { text: await stopAll($) }
+    if (sub === 'mode') {
+      const list = (Object.keys(MODES) as Mode[]).map(m => `${m}: ${MODES[m].note}`).join('; ')
+      if (!arg) return { text: `Mode ${mode}. ${list}. The pane runs full while it's open.` }
+      if (!(Object.keys(MODES) as string[]).includes(arg)) return { text: `Unknown mode "${arg}". ${list}.` }
+      mode = arg as Mode
+      await $.store.set(MODE_KEY, mode)
+      await update($, modeAtom, () => mode)
+      await syncSampler($)
+      return { text: `Session stats mode ${mode}: ${MODES[mode].note}.` }
+    }
     if (sub !== 'bar') return { text: await openPane($) }
 
     const isOn = arg === 'on' ? true : arg === 'off' ? false : !(await read($, isBarOn))
@@ -280,6 +361,7 @@ export const register: Register = on => {
   // Button, so a click anywhere on it opens the pane.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || !(await read($, isBarOn))) return next(e)
+    lastBarDrawnAt = await $.clock.now()
 
     const { Button, Text } = $.ui.resolve(e)
     const { snapshot: s, cpuHistory, ramHistory, turn, lastTurn } = await readStats($)
@@ -311,6 +393,7 @@ export const register: Register = on => {
     const st = await readStats($)
     const { snapshot: s, error, cpuHistory, ramHistory, io, net, netHistory, diskHistory, energyHistory, isRusageAvailable } = st
     const now = await $.clock.now()
+    const chosen = await read($, modeAtom)
     const width = e.props.bodyColumns ?? e.viewport?.columns ?? 80
     const noRusage = isRusageAvailable ? null : 'needs the Xcode Command Line Tools'
 
@@ -366,9 +449,13 @@ export const register: Register = on => {
             <Text dimColor> · this session {((io.watts / st.allWatts) * 100).toFixed(0)}% of the power</Text>
           ) : null}
         </Text>
-        {st.ownSince !== null && now > st.ownSince && (
-          <Text dimColor>monitor itself: {((st.ownCpuSeconds / ((now - st.ownSince) / 1000)) * 100).toFixed(1)}% of one core</Text>
-        )}
+        <Text dimColor>
+          mode {chosen}
+          {chosen === 'full' ? '' : ' (full while this pane is open)'}
+          {st.ownSince !== null && now > st.ownSince
+            ? ` · monitor itself: ${((st.ownCpuSeconds / ((now - st.ownSince) / 1000)) * 100).toFixed(1)}% of one core`
+            : ''}
+        </Text>
         <Text dimColor>
           {s.procs.length} processes · session pid {s.rootPid} up {s.procs[0]?.elapsed} · load {s.load.map(l => l.toFixed(2)).join(' ')}
         </Text>

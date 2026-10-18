@@ -23,7 +23,7 @@ Type `/session-stats` and a pane opens with:
   background sessions) totalled: watts, CPU, RAM, and this session's share of the power
 - the monitor's own cost, so you can see what watching costs
 
-It samples every 2 seconds while the pane or the bar is showing, and stops when neither is.
+It samples while the pane, the bar or a prompt needs it, at the rate the mode sets, and stops when nothing does.
 
 ### Bar mode
 
@@ -35,6 +35,28 @@ After the histories the strip shows the prompt's energy: `⚡ 120 J now` while o
 runs, `⚡ 1.2 kJ last` after. Each history is up to 30 cells wide (one minute) from the start and fills left to
 right, then scrolls. Click the strip to open the full pane. The setting is remembered across sessions;
 `/session-stats bar on` and `/session-stats bar off` set it directly.
+
+### What the monitor itself costs
+
+The bar is meant to stay on, so the monitor's own cost is yours to set with
+`/session-stats mode` (remembered across sessions):
+
+| Mode | Samples | Shows on the bar | Monitor's own cost |
+| --- | --- | --- | --- |
+| `lite` (default) | every 10 s, one cheap `ps` | CPU, RAM, prompt energy | about 0.4% of one core |
+| `normal` | every 5 s, plus the energy probe | the same, with live energy and disk for the pane | about 3% |
+| `full` | every 2 s, everything | the same, at the finest resolution | about 7% |
+
+In every mode:
+
+- Each prompt gets a full reading when it's sent and when its turn ends, so prompt
+  energy is exact even in `lite`, for about 0.1 s of CPU per prompt.
+- The pane samples at `full` while it's open (network too) and drops back when closed.
+- A session that isn't drawing the bar (a background session, or one with no terminal
+  attached) doesn't sample for it, even with the bar setting on.
+
+`/session-stats mode` with no argument shows the current mode; the pane shows the
+measured cost.
 
 ### Stopping it
 
@@ -66,15 +88,14 @@ claude plugin install session-stats --marketplace toml0006/session-activity-moni
 - Network comes from `nettop`, which takes about 5 seconds per sample, so it updates
   about every 5 seconds. A background session (`claude --bg`) sends its API traffic
   through the shared daemon, so that traffic isn't counted under the session.
-- Prompt costs are measured from submit to the end of the turn, sampling every 2 s for
-  the length of the turn even with the bar and pane off. Subagents' work inside the
+- Prompt costs are measured from submit to the end of the turn, with a full reading at
+  each end and the mode's sampling in between, even with the bar and pane off. Subagents' work inside the
   session's process tree counts toward the prompt.
 - Work the session causes outside its own process tree isn't counted: the terminal
   drawing its output, WindowServer, and macOS services woken by things it runs (for
   example, a status line calling AppleScript on every refresh woke `tccd`,
   `launchservicesd` and `runningboardd` for ~45% CPU on one machine).
-- The monitor itself costs about 0.1 s of CPU per sample (mostly `ps` listing every
-  process), roughly 5–10% of one core while it samples; the pane shows the real figure.
+- The monitor's own cost depends on the mode (see above); the pane shows the measured figure.
 - Disk and energy come from `proc_pid_rusage` (what Activity Monitor reads), called
   through the system `python3`. They need the Xcode Command Line Tools; without them
   the pane says so rather than triggering an install prompt. Energy needs macOS 13 or later.
