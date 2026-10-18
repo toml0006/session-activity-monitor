@@ -77,6 +77,11 @@ export type Stats = {
   /** CPU seconds the monitor's own probes used, and since when (clock ms) */
   ownCpuSeconds: number
   ownSince: number | null
+  /** Whether the Mac is on battery; null until checked, or on a Mac without one */
+  isOnBattery: boolean | null
+  /** The session tree's energy while on battery since the last unplug (J), and since when (clock ms) */
+  batteryJoules: number
+  batterySince: number | null
 }
 
 /** How much the monitor itself may cost: lite every 10 s, normal 5 s, full 2 s */
@@ -84,6 +89,6 @@ export type Mode = 'lite' | 'normal' | 'full'
 
 declare module 'claude-code' {
   interface PluginState {
-    'session-stats': { stats: Stats; isBarOn: boolean; mode: Mode }
+    'session-stats': { stats: Stats; isBarOn: boolean; mode: Mode; isBarPromptOn: boolean }
   }
 }
