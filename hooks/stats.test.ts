@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bytes, joules, parseBattery, parseNettop, parseProbe, parseRusage, parseTimes, rates, sparkline } from './stats'
+import { bytes, joules, parseBattery, parseNettop, parseProbe, parseRusage, parseSlim, parseTimes, rates, sparkline } from './stats'
 
 // 900 is the engine-side spawner; 950/951 are the probe's own sh and ps.
 const PROBE_OUT = `900
@@ -99,4 +99,10 @@ test('battery capacity in Wh, and none on a desktop', () => {
   expect(parseBattery('nothing')).toBe(null)
   expect(joules(340)).toBe('340 J')
   expect(joules(1250)).toBe('1.3 kJ')
+})
+
+test('the lite probe totals the tree under a known root, and says when the root is gone', () => {
+  const out = '  800     1  12.5 600000\n  810   800  50.0 200000\n  811   810   0.5  10000\n  999     1  99.0 900000\n0m0.00s 0m0.00s\n'
+  expect(parseSlim(out, 800)).toEqual({ cpu: 63, rssKb: 810000, pids: [800, 810, 811] })
+  expect(parseSlim(out, 1234)).toBe(null)
 })

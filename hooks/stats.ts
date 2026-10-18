@@ -230,3 +230,35 @@ export function bytes(n: number): string {
   }
   return `${n >= 100 || i === 0 ? n.toFixed(0) : n.toFixed(1)} ${units[i]}`
 }
+
+// The lite probe: no command names (half the CPU of the full ps), so the tree
+// hangs off a session root the last full probe found.
+export const SLIM_PROBE = ['/bin/sh', '-c', 'ps -axo pid=,ppid=,pcpu=,rss=; times'] as const
+
+/** CPU and RSS of the tree under `rootPid` from the lite probe; null when the root is gone. */
+export function parseSlim(stdout: string, rootPid: number): { cpu: number; rssKb: number; pids: number[] } | null {
+  const rows = new Map<number, number[]>()
+  const kids = new Map<number, number[]>()
+  for (const line of stdout.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s*$/.exec(line)
+    if (!m) continue
+    const [pid, ppid, cpu, rss] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])]
+    rows.set(pid, [cpu, rss])
+    kids.set(ppid, [...(kids.get(ppid) ?? []), pid])
+  }
+  if (!rows.has(rootPid)) return null
+  const pids: number[] = []
+  const stack = [rootPid]
+  while (stack.length) {
+    const pid = stack.pop()!
+    pids.push(pid)
+    stack.push(...(kids.get(pid) ?? []))
+  }
+  // Without names the probe's own sh and ps can't be told apart and are counted;
+  // they read ~0% CPU (just started) and ~2 MB, too little to matter on the bar
+  return {
+    cpu: pids.reduce((s, p) => s + (rows.get(p)?.[0] ?? 0), 0),
+    rssKb: pids.reduce((s, p) => s + (rows.get(p)?.[1] ?? 0), 0),
+    pids,
+  }
+}

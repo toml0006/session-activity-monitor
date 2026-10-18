@@ -79,8 +79,11 @@ export type Stats = {
   ownSince: number | null
 }
 
+/** How much the monitor itself may cost: lite every 10 s, normal 5 s, full 2 s */
+export type Mode = 'lite' | 'normal' | 'full'
+
 declare module 'claude-code' {
   interface PluginState {
-    'session-stats': { stats: Stats; isBarOn: boolean }
+    'session-stats': { stats: Stats; isBarOn: boolean; mode: Mode }
   }
 }
