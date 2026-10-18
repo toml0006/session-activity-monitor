@@ -1,6 +1,6 @@
 {
   "name": "session-stats",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "/session-stats opens a live pane with CPU, RAM and the process tree of this Claude session",
   "author": { "name": "Jackson Tomlinson" },
   "repository": "https://github.com/toml0006/session-activity-monitor",

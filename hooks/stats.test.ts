@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bytes, parseNettop, parseProbe, parseRusage, rates, sparkline } from './stats'
+import { bytes, joules, parseBattery, parseNettop, parseProbe, parseRusage, parseTimes, rates, sparkline } from './stats'
 
 // 900 is the engine-side spawner; 950/951 are the probe's own sh and ps.
 const PROBE_OUT = `900
@@ -76,4 +76,27 @@ test('the io probes the mod starts are left out, a nettop the person runs is kep
     .replace('  951   950   0.0    900 00:00 ps', '  951   811   0.0    900 00:00 nettop')
   const s = parseProbe(out.replace(/^900\n/, '811\n'))
   expect(s.procs.map(p => p.pid)).toEqual([800, 810, 811, 951, 900])
+})
+
+test('every Claude tree on the machine is totalled, each process under its nearest claude', () => {
+  const s = parseProbe(PROBE_OUT.replace(/^900\n/, '811\n'))
+  expect(s.allClaude.trees).toBe(3)
+  // 950/951 are a probe of the session 900's, not of this one: real activity there
+  expect([...s.allClaude.pids].sort((a, b) => a - b)).toEqual([100, 800, 810, 811, 900, 950, 951])
+  expect(s.allClaude.cpu).toBe(64)
+})
+
+test('times gives the CPU seconds the probe commands used', () => {
+  expect(Math.round(parseTimes('0m0.010s 0m0.020s\n1m0.500s 0m0.250s') * 100)).toBe(6075)
+  expect(parseTimes('no times here')).toBe(0)
+})
+
+test('battery capacity in Wh, and none on a desktop', () => {
+  expect(parseBattery('"AppleRawMaxCapacity" = 6000\n"Voltage" = 12000')).toBe(72)
+  // As ioreg prints it on Apple silicon: MaxCapacity is a percent, mAh is nested
+  expect(parseBattery('"Voltage" = 12000\n"MaxCapacity" = 100\n"BatteryData" = {"NominalChargeCapacity"=6000,"DesignCapacity"=8694}')).toBe(72)
+  expect(parseBattery('"MaxCapacity" = 100')).toBe(null)
+  expect(parseBattery('nothing')).toBe(null)
+  expect(joules(340)).toBe('340 J')
+  expect(joules(1250)).toBe('1.3 kJ')
 })

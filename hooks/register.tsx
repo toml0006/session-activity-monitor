@@ -1,9 +1,24 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Io, Stats } from '../types'
+import type { Io, Stats, Turn } from '../types'
 import type { Counters } from './stats'
-import { NET_PROBE, PROBE, bytes, gb, ioProbe, parseNettop, parseProbe, parseRusage, rates, sparkline } from './stats'
+import {
+  BATTERY_PROBE,
+  NET_PROBE,
+  PROBE,
+  bytes,
+  gb,
+  ioProbe,
+  joules,
+  parseBattery,
+  parseNettop,
+  parseProbe,
+  parseRusage,
+  parseTimes,
+  rates,
+  sparkline,
+} from './stats'
 
 const PANE = 'session-stats'
 const PERIOD_MS = 2000
@@ -11,6 +26,8 @@ const HISTORY = 120
 // Each history in the bar is at most this many cells (one minute of samples)
 const BAR_SPAN = 30
 const BAR_KEY = 'bar'
+// A prompt whose tree used at least this much energy raises a toast
+const TOAST_JOULES = 300
 const EMPTY: Stats = {
   snapshot: null,
   error: null,
@@ -22,17 +39,31 @@ const EMPTY: Stats = {
   netHistory: [],
   diskHistory: [],
   energyHistory: [],
+  allWatts: null,
+  cpuSeconds: 0,
+  turn: null,
+  lastTurn: null,
+  batteryWh: null,
+  ownCpuSeconds: 0,
+  ownSince: null,
 }
 const stats = atom({ plugin: 'session-stats', key: 'stats' } as const, EMPTY)
 const isBarOn = atom({ plugin: 'session-stats', key: 'isBarOn' } as const, false)
 
+const batteryShare = (j: number, wh: number) => `${((j / (wh * 3600)) * 100).toFixed(j / (wh * 3600) >= 0.01 ? 1 : 2)}%`
+
+const joulesColor = (j: number) => (j >= TOAST_JOULES ? 'red' : j >= TOAST_JOULES / 3 ? 'yellow' : 'green')
+const duration = (sec: number) => (sec >= 60 ? `${Math.floor(sec / 60)}m${String(Math.round(sec % 60)).padStart(2, '0')}s` : `${sec.toFixed(0)}s`)
+
 const cpuColor = (cpu: number) => (cpu >= 100 ? 'red' : cpu >= 50 ? 'yellow' : 'green')
 const ramColor = (kb: number) => (kb >= 4194304 ? 'red' : kb >= 2097152 ? 'yellow' : 'green')
 
-// One sampler serves both the bar and the pane, and runs only while either
-// is showing. A reload resets these; session.start restarts it for the bar.
+// One sampler serves the bar, the pane and a running prompt, and runs only
+// while one of them needs it. A reload resets these; session.start restarts it.
 let timer: Timer | undefined
 let isPaneOpen = false
+let isTurnRunning = false
+let prevSampleAt: number | undefined
 
 // The previous cumulative counters, to turn the next ones into rates
 let prevRusage: { at: number; counters: Counters } | undefined
@@ -51,16 +82,30 @@ async function updateStats($: EngineInterface, fn: (s: Stats) => Stats) {
   await update($, stats, s => fn({ ...EMPTY, ...s }))
 }
 
+// "running 45s · 120 J (0.1% of battery) · 30 CPU-s · peak 3.2 cores"
+function promptSummary(st: Stats): string {
+  const t = st.turn ?? st.lastTurn
+  if (!t) return 'no prompt measured yet'
+  const battery = st.batteryWh ? ` (${batteryShare(t.joules, st.batteryWh)} of battery)` : ''
+  return `${st.turn ? 'running' : 'last'} ${duration(t.seconds)} · ${joules(t.joules)}${battery} · ${t.cpuSeconds.toFixed(0)} CPU-s · peak ${(t.peakCpu / 100).toFixed(1)} cores`
+}
+
 async function sample($: EngineInterface) {
   try {
-    const { stdout } = await $.process.run(PROBE, { env: { LC_ALL: 'C' }, timeoutMs: 5000 })
-    const snap = parseProbe(stdout)
+    const ps = await $.process.run(PROBE, { env: { LC_ALL: 'C' }, timeoutMs: 5000 })
+    const snap = parseProbe(ps.stdout)
     const pids = snap.procs.map(p => p.pid)
 
-    const probe = ioProbe(pids)
-    const usage = parseRusage((await $.process.run(probe.argv, { env: probe.env, timeoutMs: 5000 })).stdout)
+    // One rusage call covers every Claude tree, so this session's share is known
+    const probe = ioProbe(snap.allClaude.pids)
+    const io$ = await $.process.run(probe.argv, { env: probe.env, timeoutMs: 5000 })
+    const usage = parseRusage(io$.stdout)
     const at = await $.clock.now()
+    const sinceLast = prevSampleAt === undefined ? 0 : (at - prevSampleAt) / 1000
+    prevSampleAt = at
+
     let io: Io | null = null
+    let allWatts: number | null = null
     let seconds = 0
     if (prevRusage && usage.size > 0) {
       seconds = (at - prevRusage.at) / 1000
@@ -72,20 +117,38 @@ async function sample($: EngineInterface) {
       }
       const watts = hasEnergy ? (total[2] ?? 0) / 1e9 : 0
       io = { diskRead: total[0] ?? 0, diskWrite: total[1] ?? 0, watts, hasEnergy, joules: 0 }
+      if (hasEnergy) allWatts = (rates(prevRusage.counters, usage, seconds, snap.allClaude.pids).total[2] ?? 0) / 1e9
     }
     prevRusage = usage.size > 0 ? { at, counters: usage } : undefined
+    const cpuDelta = (snap.cpu / 100) * sinceLast
+    const ownDelta = parseTimes(ps.stdout) + parseTimes(io$.stdout)
 
-    await updateStats($, s => ({
-      ...s,
-      snapshot: snap,
-      error: null,
-      cpuHistory: push(s.cpuHistory, snap.cpu),
-      ramHistory: push(s.ramHistory, snap.rssKb),
-      isRusageAvailable: usage.size > 0,
-      io: io ? { ...io, joules: (s.io?.joules ?? 0) + io.watts * seconds } : s.io,
-      diskHistory: io ? push(s.diskHistory, io.diskRead + io.diskWrite) : s.diskHistory,
-      energyHistory: io?.hasEnergy ? push(s.energyHistory, io.watts) : s.energyHistory,
-    }))
+    await updateStats($, s => {
+      const energy = io ? io.watts * seconds : 0
+      const turn: Turn | null = s.turn && {
+        ...s.turn,
+        seconds: (at - s.turn.startedAt) / 1000,
+        joules: s.turn.joules + energy,
+        cpuSeconds: s.turn.cpuSeconds + cpuDelta,
+        peakCpu: Math.max(s.turn.peakCpu, snap.cpu),
+      }
+      return {
+        ...s,
+        snapshot: snap,
+        error: null,
+        cpuHistory: push(s.cpuHistory, snap.cpu),
+        ramHistory: push(s.ramHistory, snap.rssKb),
+        isRusageAvailable: usage.size > 0,
+        io: io ? { ...io, joules: (s.io?.joules ?? 0) + energy } : s.io,
+        diskHistory: io ? push(s.diskHistory, io.diskRead + io.diskWrite) : s.diskHistory,
+        energyHistory: io?.hasEnergy ? push(s.energyHistory, io.watts) : s.energyHistory,
+        allWatts: allWatts ?? s.allWatts,
+        cpuSeconds: s.cpuSeconds + cpuDelta,
+        turn,
+        ownCpuSeconds: s.ownCpuSeconds + ownDelta,
+        ownSince: s.ownSince ?? at,
+      }
+    })
     if (!isNetBusy) void sampleNet($, pids)
   } catch (err) {
     await updateStats($, s => ({ ...s, error: String(err) }))
@@ -95,8 +158,11 @@ async function sample($: EngineInterface) {
 async function sampleNet($: EngineInterface, pids: readonly number[]) {
   isNetBusy = true
   try {
-    const counters = parseNettop((await $.process.run(NET_PROBE, { timeoutMs: 15000 })).stdout)
+    const { stdout } = await $.process.run(NET_PROBE, { timeoutMs: 15000 })
+    const counters = parseNettop(stdout)
     const at = await $.clock.now()
+    const own = parseTimes(stdout)
+    await updateStats($, s => ({ ...s, ownCpuSeconds: s.ownCpuSeconds + own }))
     if (prevNet) {
       const { total } = rates(prevNet.counters, counters, (at - prevNet.at) / 1000, pids)
       const net = { bytesIn: total[0] ?? 0, bytesOut: total[1] ?? 0 }
@@ -111,13 +177,14 @@ async function sampleNet($: EngineInterface, pids: readonly number[]) {
 }
 
 async function syncSampler($: EngineInterface) {
-  const isNeeded = isPaneOpen || (await read($, isBarOn))
+  const isNeeded = isPaneOpen || isTurnRunning || (await read($, isBarOn))
   if (isNeeded && !timer) {
     await sample($)
     timer = $.clock.every(PERIOD_MS, () => void sample($))
   } else if (!isNeeded && timer) {
     timer.cancel()
     timer = undefined
+    prevSampleAt = undefined
   }
 }
 
@@ -150,11 +217,42 @@ export const register: Register = on => {
     })
     const isOn = (await $.store.get(BAR_KEY)) === true
     await update($, isBarOn, () => isOn)
+    const batteryWh = await $.process
+      .run(BATTERY_PROBE, { timeoutMs: 5000 })
+      .then(r => parseBattery(r.stdout))
+      .catch(() => null)
+    await updateStats($, s => ({ ...s, batteryWh }))
     // A reload keeps an open pane open but forgets it here; ask, so it keeps updating
     isPaneOpen = await $.ui
       .panes()
       .then(panes => panes.some(pane => pane.id === PANE))
       .catch(() => false)
+    await syncSampler($)
+    return next(e)
+  })
+
+  // A prompt's cost: sample from its submit to its turn's end, whatever is showing
+  on('prompt.submit', async ($, e, next) => {
+    const startedAt = await $.clock.now()
+    await updateStats($, s => ({ ...s, turn: { startedAt, seconds: 0, joules: 0, cpuSeconds: 0, peakCpu: 0 } }))
+    isTurnRunning = true
+    await syncSampler($)
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    // A subagent's turn ends inside the prompt's; only the main loop's ends it
+    if (e.agentId !== undefined) return next(e)
+    const { turn, batteryWh } = await readStats($)
+    isTurnRunning = false
+    if (turn) {
+      const done = { ...turn, seconds: ((await $.clock.now()) - turn.startedAt) / 1000 }
+      await updateStats($, s => ({ ...s, turn: null, lastTurn: done }))
+      if (done.joules >= TOAST_JOULES) {
+        const battery = batteryWh ? `, ${batteryShare(done.joules, batteryWh)} of your battery` : ''
+        $.ui.toast(`That prompt used ${joules(done.joules)}${battery} (peak ${(done.peakCpu / 100).toFixed(1)} cores)`)
+      }
+    }
     await syncSampler($)
     return next(e)
   })
@@ -184,10 +282,13 @@ export const register: Register = on => {
     if (e.props.hasSurvey || !(await read($, isBarOn))) return next(e)
 
     const { Button, Text } = $.ui.resolve(e)
-    const { snapshot: s, cpuHistory, ramHistory } = await readStats($)
+    const { snapshot: s, cpuHistory, ramHistory, turn, lastTurn } = await readStats($)
     const width = e.props.bodyColumns ?? e.viewport?.columns ?? 80
+    // The prompt's energy: the one running, else the last one
+    const shown = turn ?? lastTurn
+    const prompt = shown ? `  ⚡ ${joules(shown.joules)} ${turn ? 'now' : 'last'}` : ''
     // "⚙ CPU 100% " + " " + " RAM 10.0G " + " " is 26 cells around the two histories
-    const span = Math.max(6, Math.min(BAR_SPAN, Math.floor((width - 26) / 2)))
+    const span = Math.max(6, Math.min(BAR_SPAN, Math.floor((width - 26 - prompt.length) / 2)))
     const cpu = sparkline(cpuHistory.slice(-span))
     const ram = sparkline(ramHistory.slice(-span))
 
@@ -200,14 +301,16 @@ export const register: Register = on => {
         <Text color={ramColor(s?.rssKb ?? 0)}>{(s ? `${gb(s.rssKb)}G` : '…').padStart(5)} </Text>
         <Text color="magenta">{ram}</Text>
         <Text dimColor>{'·'.repeat(span - ram.length)}</Text>
+        {shown && <Text color={joulesColor(shown.joules)}>{prompt}</Text>}
       </Button>
     )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const { snapshot: s, error, cpuHistory, ramHistory, io, net, netHistory, diskHistory, energyHistory, isRusageAvailable } =
-      await readStats($)
+    const st = await readStats($)
+    const { snapshot: s, error, cpuHistory, ramHistory, io, net, netHistory, diskHistory, energyHistory, isRusageAvailable } = st
+    const now = await $.clock.now()
     const width = e.props.bodyColumns ?? e.viewport?.columns ?? 80
     const noRusage = isRusageAvailable ? null : 'needs the Xcode Command Line Tools'
 
@@ -216,7 +319,7 @@ export const register: Register = on => {
     const machinePct = (s.cpu / s.cores).toFixed(0)
     const ramPct = ((s.rssKb * 1024 * 100) / s.memBytes).toFixed(1)
     const spark = Math.max(10, Math.min(HISTORY, width - 14))
-    const room = Math.max(3, (e.viewport?.rows ?? 30) - 18)
+    const room = Math.max(3, (e.viewport?.rows ?? 30) - 21)
     const nameCols = Math.max(10, width - 31)
     const pad = (v: string, n: number) => v.padStart(n)
 
@@ -250,6 +353,22 @@ export const register: Register = on => {
           {io?.hasEnergy && <Text dimColor> ({io.joules.toFixed(0)} J since sampling began)</Text>}
         </Text>
         <Text color="red">{sparkline(energyHistory.slice(-spark))}</Text>
+        <Text>
+          <Text bold>PROMPT </Text>
+          {promptSummary(st)}
+        </Text>
+        <Text>
+          <Text bold>ALL CLAUDE </Text>
+          {s.allClaude
+            ? `${s.allClaude.trees} trees · ${st.allWatts === null ? '…' : st.allWatts.toFixed(2)} W · ${s.allClaude.cpu.toFixed(0)}% CPU · ${gb(s.allClaude.rssKb)} GB`
+            : '…'}
+          {s.allClaude && st.allWatts && io?.hasEnergy ? (
+            <Text dimColor> · this session {((io.watts / st.allWatts) * 100).toFixed(0)}% of the power</Text>
+          ) : null}
+        </Text>
+        {st.ownSince !== null && now > st.ownSince && (
+          <Text dimColor>monitor itself: {((st.ownCpuSeconds / ((now - st.ownSince) / 1000)) * 100).toFixed(1)}% of one core</Text>
+        )}
         <Text dimColor>
           {s.procs.length} processes · session pid {s.rootPid} up {s.procs[0]?.elapsed} · load {s.load.map(l => l.toFixed(2)).join(' ')}
         </Text>
