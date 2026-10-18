@@ -5,10 +5,22 @@ import type { Proc, Snapshot } from '../types'
 export const PROBE = [
   '/bin/sh',
   '-c',
-  'echo $PPID; sysctl -n hw.ncpu hw.memsize vm.loadavg; ps -axo pid=,ppid=,pcpu=,rss=,etime=,comm=',
+  'echo $PPID; sysctl -n hw.ncpu hw.memsize vm.loadavg; ps -axo pid=,ppid=,pcpu=,rss=,etime=,comm=; times',
 ] as const
 
+/**
+ * CPU seconds a probe's own commands used, from the \`times\` its shell prints
+ * last (children's user and system time), so the monitor can report its cost.
+ */
+export function parseTimes(stdout: string): number {
+  const last = stdout.trim().split('\n').pop() ?? ''
+  const parts = [...last.matchAll(/(\d+)m([\d.]+)s/g)].map(m => Number(m[1]) * 60 + Number(m[2]))
+  return parts.length === 2 ? (parts[0] ?? 0) + (parts[1] ?? 0) : 0
+}
+
 const ROW = /^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s+(\S+)\s+(.*)$/
+
+const PROBE_COMMANDS = ['ps', 'nettop', 'Python', 'python3']
 
 // "claude bg-spare" and "/Users/x/.local/bin/claude" both name a claude process
 const isClaude = (name: string) => name.split(' ')[0]?.split('/').pop() === 'claude'
@@ -53,10 +65,15 @@ export function parseProbe(stdout: string): Snapshot {
 
   // Depth-first so the table reads as a tree; busiest siblings first. The probe's
   // own sh and ps are left out, since they exist only because we asked.
+  // The mod's own probes: an sh under the spawner or the session running ps,
+  // nettop or python, and those children. They exist only because we asked.
   const probePids = new Set<number>()
-  for (const sh of children.get(Number(spawner)) ?? []) {
-    const ps = (children.get(sh.pid) ?? []).find(c => shortName(c.name) === 'ps')
-    if (shortName(sh.name) === 'sh' && ps) probePids.add(sh.pid).add(ps.pid)
+  for (const sh of [...(children.get(Number(spawner)) ?? []), ...(children.get(rootPid) ?? [])]) {
+    const kids = children.get(sh.pid) ?? []
+    if (shortName(sh.name) === 'sh' && kids.some(k => PROBE_COMMANDS.includes(shortName(k.name)))) {
+      probePids.add(sh.pid)
+      for (const k of kids) probePids.add(k.pid)
+    }
   }
   const procs: Proc[] = []
   // The io probes (nettop, and python under sh) are the session's direct children
@@ -70,9 +87,34 @@ export function parseProbe(stdout: string): Snapshot {
   }
   walk(all.get(rootPid)!, 0)
 
+  // Every Claude process tree on the machine: each process counts toward its
+  // nearest claude ancestor, so nested sessions (a background session under the
+  // daemon) are counted once, under the session that owns them.
+  const owner = new Map<number, number | null>()
+  const ownerOf = (pid: number): number | null => {
+    if (owner.has(pid)) return owner.get(pid)!
+    const p = all.get(pid)
+    const o = !p ? null : isClaude(p.name) ? pid : p.ppid > 1 ? ownerOf(p.ppid) : null
+    owner.set(pid, o)
+    return o
+  }
+  const trees = new Set<number>()
+  const claudePids: number[] = []
+  let allCpu = 0
+  let allRss = 0
+  for (const p of all.values()) {
+    const o = ownerOf(p.pid)
+    if (o === null || probePids.has(p.pid)) continue
+    trees.add(o)
+    claudePids.push(p.pid)
+    allCpu += p.cpu
+    allRss += p.rssKb
+  }
+
   return {
     rootPid,
     rootName: shortName(all.get(rootPid)!.name),
+    allClaude: { trees: trees.size, cpu: allCpu, rssKb: allRss, pids: claudePids },
     cores: Number(ncpu),
     memBytes: Number(memsize),
     load: loadavg.replace(/[{}]/g, '').trim().split(/\s+/).map(Number),
@@ -112,12 +154,31 @@ for pid in map(int, sys.argv[1:]):
 // silicon, so before v6 the energy column is -1, unknown.
 
 export const ioProbe = (pids: readonly number[]) => ({
-  argv: ['/bin/sh', '-c', 'xcode-select -p >/dev/null 2>&1 && exec /usr/bin/python3 -I -c "$PY" "$@"', 'sh', ...pids.map(String)],
+  argv: ['/bin/sh', '-c', 'xcode-select -p >/dev/null 2>&1 && /usr/bin/python3 -I -c "$PY" "$@"; times', 'sh', ...pids.map(String)],
   env: { PY: RUSAGE_PY },
 })
 
 // One nettop sample takes about 5 s, so it runs beside the 2 s sampler, not in it
-export const NET_PROBE = ['/usr/bin/nettop', '-P', '-L', '1', '-x', '-J', 'bytes_in,bytes_out'] as const
+export const NET_PROBE = ['/bin/sh', '-c', '/usr/bin/nettop -P -L 1 -x -J bytes_in,bytes_out; times'] as const
+
+// The battery's full charge in watt-hours, to put a prompt's energy in battery terms
+export const BATTERY_PROBE = ['/usr/sbin/ioreg', '-rn', 'AppleSmartBattery'] as const
+
+/**
+ * Full-charge capacity in Wh from ioreg, or null on a Mac without a battery.
+ * Capacity is in mAh in the nested battery data (NominalChargeCapacity, else
+ * AppleRawMaxCapacity); the top-level MaxCapacity is a percentage, never used.
+ */
+export function parseBattery(stdout: string): number | null {
+  const field = (k: string) => new RegExp(`"${k}"\\s*=\\s*(\\d+)`).exec(stdout)?.[1]
+  const mah = field('NominalChargeCapacity') ?? field('AppleRawMaxCapacity')
+  const mv = field('Voltage')
+  if (!mah || !mv) return null
+  return (Number(mah) * Number(mv)) / 1e6
+}
+
+/** "340 J", "1.2 kJ" */
+export const joules = (j: number) => (j >= 1000 ? `${(j / 1000).toFixed(1)} kJ` : `${j.toFixed(0)} J`)
 
 export type Counters = Map<number, number[]>
 

@@ -10,9 +10,13 @@ export type Proc = {
   watts: number | null
 }
 
+/** Every Claude process tree on the machine, this session's included */
+export type AllClaude = { trees: number; cpu: number; rssKb: number; pids: number[] }
+
 export type Snapshot = {
   rootPid: number
   rootName: string
+  allClaude: AllClaude
   cores: number
   memBytes: number
   load: number[]
@@ -35,6 +39,19 @@ export type Io = {
 
 export type Net = { bytesIn: number; bytesOut: number }
 
+/** One prompt, from its submit to its turn's end */
+export type Turn = {
+  /** Clock time it started, in ms */
+  startedAt: number
+  seconds: number
+  /** Energy the session's tree used, in joules */
+  joules: number
+  /** CPU time the session's tree used, in seconds */
+  cpuSeconds: number
+  /** Highest CPU % sampled during it (100 = one core) */
+  peakCpu: number
+}
+
 export type Stats = {
   snapshot: Snapshot | null
   error: string | null
@@ -48,6 +65,18 @@ export type Stats = {
   netHistory: number[]
   diskHistory: number[]
   energyHistory: number[]
+  /** Power of every Claude tree on the machine, in watts; null until two samples */
+  allWatts: number | null
+  /** Running totals for the session's tree since sampling began */
+  cpuSeconds: number
+  /** The prompt running now (its totals so far) and the last one that finished */
+  turn: Turn | null
+  lastTurn: Turn | null
+  /** Full battery in Wh; null on a Mac without one */
+  batteryWh: number | null
+  /** CPU seconds the monitor's own probes used, and since when (clock ms) */
+  ownCpuSeconds: number
+  ownSince: number | null
 }
 
 declare module 'claude-code' {
