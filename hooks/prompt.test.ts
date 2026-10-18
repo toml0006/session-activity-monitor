@@ -25,6 +25,7 @@ const world = (on: On) => {
   on('process.run', ($, e) => {
     const cmd = e.argv.join(' ')
     if (cmd.includes('ioreg')) return ok(BATTERY)
+    if (cmd.includes('pmset')) return ok("Now drawing from 'AC Power'\n")
     if (cmd.includes('ps -axo')) return ok(PS_OUT)
     if (cmd.includes('nettop')) return ok('')
     samples += 1
@@ -65,6 +66,6 @@ test('a prompt is measured from submit to turn end, and an expensive one raises 
     props: { bodyColumns: 90 } as never,
   })
   const drawn = JSON.stringify(await ui.drawn())
-  expect(drawn).toContain('last 2s · 600 J (0.23% of battery)')
+  expect(drawn).toContain('last 2s · 0.23% of battery (600 J)')
   expect(drawn).toContain('ALL CLAUDE')
 })

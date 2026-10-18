@@ -262,3 +262,16 @@ export function parseSlim(stdout: string, rootPid: number): { cpu: number; rssKb
     pids,
   }
 }
+
+// Whether the Mac runs on battery: checked about once a minute (~9 ms of CPU)
+export const POWER_SOURCE_PROBE = ['/usr/bin/pmset', '-g', 'batt'] as const
+
+/** On battery or AC from `pmset -g batt`; null on a Mac that doesn't say (no battery). */
+export function parsePowerSource(stdout: string): boolean | null {
+  if (stdout.includes("'Battery Power'")) return true
+  if (stdout.includes("'AC Power'") || stdout.includes("'UPS Power'")) return false
+  return null
+}
+
+/** "0.42 W", "12 W" */
+export const watts = (w: number) => `${w >= 10 ? w.toFixed(0) : w.toFixed(2)} W`

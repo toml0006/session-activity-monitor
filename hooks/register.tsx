@@ -6,6 +6,7 @@ import type { Counters } from './stats'
 import {
   BATTERY_PROBE,
   NET_PROBE,
+  POWER_SOURCE_PROBE,
   PROBE,
   SLIM_PROBE,
   bytes,
@@ -14,23 +15,27 @@ import {
   joules,
   parseBattery,
   parseNettop,
+  parsePowerSource,
   parseProbe,
   parseRusage,
   parseSlim,
   parseTimes,
   rates,
   sparkline,
+  watts,
 } from './stats'
 
 const PANE = 'session-stats'
 // What each mode costs, measured on an M-series Mac: the full ps is ~86 ms of CPU,
 // the nameless one ~44 ms, the python energy probe ~55 ms, nettop ~128 ms
 const MODES: Record<Mode, { ms: number; note: string }> = {
-  lite: { ms: 10000, note: 'every 10 s, CPU and RAM only, about 0.4% of one core' },
+  lite: { ms: 10000, note: 'every 10 s, CPU, RAM and power, about 1% of one core' },
   normal: { ms: 5000, note: 'every 5 s, with live energy and disk, about 3% of one core' },
   full: { ms: 2000, note: 'every 2 s, everything, about 7% of one core (plus nettop with the pane open)' },
 }
 const MODE_KEY = 'mode'
+const BAR_PROMPT_KEY = 'barPrompt'
+const POWER_CHECK_MS = 60_000
 const HISTORY = 120
 // Each history in the bar is at most this many cells (one minute of samples)
 const BAR_SPAN = 30
@@ -55,12 +60,36 @@ const EMPTY: Stats = {
   batteryWh: null,
   ownCpuSeconds: 0,
   ownSince: null,
+  isOnBattery: null,
+  batteryJoules: 0,
+  batterySince: null,
 }
 const stats = atom({ plugin: 'session-stats', key: 'stats' } as const, EMPTY)
 const isBarOn = atom({ plugin: 'session-stats', key: 'isBarOn' } as const, false)
 const modeAtom = atom({ plugin: 'session-stats', key: 'mode' } as const, 'lite' as Mode)
+// Per-prompt joules on the bar: off by default, the bar leads with watts and battery
+const isBarPromptOn = atom({ plugin: 'session-stats', key: 'isBarPromptOn' } as const, false)
 
-const batteryShare = (j: number, wh: number) => `${((j / (wh * 3600)) * 100).toFixed(j / (wh * 3600) >= 0.01 ? 1 : 2)}%`
+// "<0.01%" for a trace, two decimals under 1%, one above
+const batteryShare = (j: number, wh: number) => {
+  const pct = (j / (wh * 3600)) * 100
+  return pct > 0 && pct < 0.01 ? '<0.01%' : `${pct.toFixed(pct >= 1 ? 1 : 2)}%`
+}
+
+const wattsColor = (w: number) => (w >= 5 ? 'red' : w >= 1 ? 'yellow' : 'green')
+const batteryColor = (j: number, wh: number | null) => {
+  const pct = wh ? (j / (wh * 3600)) * 100 : 0
+  return pct >= 5 ? 'red' : pct >= 2 ? 'yellow' : 'green'
+}
+const clockTime = (ms: number) => new Date(ms).toTimeString().slice(0, 5)
+
+// "0.31% of the battery used by this session since 08:12" or "on AC power"
+function batterySummary(st: Stats): string {
+  if (st.isOnBattery === null) return 'battery: unknown'
+  if (!st.isOnBattery) return 'on AC power'
+  const used = st.batteryWh ? batteryShare(st.batteryJoules, st.batteryWh) : joules(st.batteryJoules)
+  return `${used} of the battery used by this session${st.batterySince ? ` since ${clockTime(st.batterySince)}` : ''}`
+}
 
 const joulesColor = (j: number) => (j >= TOAST_JOULES ? 'red' : j >= TOAST_JOULES / 3 ? 'yellow' : 'green')
 const duration = (sec: number) => (sec >= 60 ? `${Math.floor(sec / 60)}m${String(Math.round(sec % 60)).padStart(2, '0')}s` : `${sec.toFixed(0)}s`)
@@ -79,6 +108,7 @@ let mode: Mode = 'lite'
 // When this session last drew the bar: a session that doesn't draw it (a
 // background spare, no surface attached) has no reason to sample for it
 let lastBarDrawnAt: number | undefined
+let lastPowerCheckAt: number | undefined
 
 // The pane shows everything, so it samples at full while it's open
 const effectiveMode = (): Mode => (isPaneOpen ? 'full' : mode)
@@ -104,8 +134,8 @@ async function updateStats($: EngineInterface, fn: (s: Stats) => Stats) {
 function promptSummary(st: Stats): string {
   const t = st.turn ?? st.lastTurn
   if (!t) return 'no prompt measured yet'
-  const battery = st.batteryWh ? ` (${batteryShare(t.joules, st.batteryWh)} of battery)` : ''
-  return `${st.turn ? 'running' : 'last'} ${duration(t.seconds)} · ${joules(t.joules)}${battery} · ${t.cpuSeconds.toFixed(0)} CPU-s · peak ${(t.peakCpu / 100).toFixed(1)} cores`
+  const energy = st.batteryWh ? `${batteryShare(t.joules, st.batteryWh)} of battery (${joules(t.joules)})` : joules(t.joules)
+  return `${st.turn ? 'running' : 'last'} ${duration(t.seconds)} · ${energy} · ${t.cpuSeconds.toFixed(0)} CPU-s · peak ${(t.peakCpu / 100).toFixed(1)} cores`
 }
 
 // A periodic tick: skipped when only an undrawn bar wants it, the nameless ps
@@ -116,6 +146,7 @@ async function sample($: EngineInterface, force = false) {
     const now = await $.clock.now()
     const isBarUnseen = lastBarDrawnAt === undefined || now - lastBarDrawnAt > 3 * MODES[effectiveMode()].ms + 2000
     if (!force && !isPaneOpen && !isTurnRunning && isBarUnseen) return
+    await checkPower($, now)
     const { snapshot } = await readStats($)
     if (!force && effectiveMode() === 'lite' && snapshot && (await sampleSlim($, snapshot))) return
 
@@ -170,6 +201,7 @@ async function sample($: EngineInterface, force = false) {
         diskHistory: io ? push(s.diskHistory, io.diskRead + io.diskWrite) : s.diskHistory,
         energyHistory: io?.hasEnergy ? push(s.energyHistory, io.watts) : s.energyHistory,
         allWatts: allWatts ?? s.allWatts,
+        batteryJoules: s.batteryJoules + (s.isOnBattery ? energy : 0),
         cpuSeconds: s.cpuSeconds + cpuDelta,
         turn,
         ownCpuSeconds: s.ownCpuSeconds + ownDelta,
@@ -182,19 +214,36 @@ async function sample($: EngineInterface, force = false) {
   }
 }
 
-// Lite: CPU and RAM of the tree under the known root, nothing else. False when
-// the root is gone, so the caller takes a full reading instead.
+// Lite: CPU, RAM and power of the tree under the known root (no names, no
+// other sessions, no disk history). False when the root is gone, so the caller
+// takes a full reading instead.
 async function sampleSlim($: EngineInterface, snap: Snapshot): Promise<boolean> {
   const { stdout } = await $.process.run(SLIM_PROBE, { env: { LC_ALL: 'C' }, timeoutMs: 5000 })
   const tree = parseSlim(stdout, snap.rootPid)
   if (!tree) return false
+  const probe = ioProbe(tree.pids)
+  const io$ = await $.process.run(probe.argv, { env: probe.env, timeoutMs: 5000 })
+  const usage = parseRusage(io$.stdout)
   const at = await $.clock.now()
   const sinceLast = prevSampleAt === undefined ? 0 : (at - prevSampleAt) / 1000
   prevSampleAt = at
+  let io: Io | null = null
+  let seconds = 0
+  if (prevRusage && usage.size > 0) {
+    seconds = (at - prevRusage.at) / 1000
+    const { total } = rates(prevRusage.counters, usage, seconds, tree.pids)
+    const hasEnergy = [...usage.values()].every(c => (c[2] ?? -1) >= 0)
+    io = { diskRead: total[0] ?? 0, diskWrite: total[1] ?? 0, watts: hasEnergy ? (total[2] ?? 0) / 1e9 : 0, hasEnergy, joules: 0 }
+  }
+  if (usage.size > 0) prevRusage = { at, counters: usage }
   const cpuDelta = (tree.cpu / 100) * sinceLast
-  const own = parseTimes(stdout)
+  const own = parseTimes(stdout) + parseTimes(io$.stdout)
+  const energy = io ? io.watts * seconds : 0
   await updateStats($, s => ({
     ...s,
+    io: io ? { ...io, joules: (s.io?.joules ?? 0) + energy } : s.io,
+    energyHistory: io?.hasEnergy ? push(s.energyHistory, io.watts) : s.energyHistory,
+    batteryJoules: s.batteryJoules + (s.isOnBattery ? energy : 0),
     snapshot: s.snapshot && { ...s.snapshot, cpu: tree.cpu, rssKb: tree.rssKb },
     error: null,
     cpuHistory: push(s.cpuHistory, tree.cpu),
@@ -203,6 +252,7 @@ async function sampleSlim($: EngineInterface, snap: Snapshot): Promise<boolean> 
     turn: s.turn && {
       ...s.turn,
       seconds: (at - s.turn.startedAt) / 1000,
+      joules: s.turn.joules + energy,
       cpuSeconds: s.turn.cpuSeconds + cpuDelta,
       peakCpu: Math.max(s.turn.peakCpu, tree.cpu),
     },
@@ -210,6 +260,22 @@ async function sampleSlim($: EngineInterface, snap: Snapshot): Promise<boolean> 
     ownSince: s.ownSince ?? at,
   }))
   return true
+}
+
+// On battery or AC, about once a minute. Unplugging (or the first look finding
+// the Mac on battery) starts the battery count from zero; plugging in pauses it.
+async function checkPower($: EngineInterface, at: number) {
+  if (lastPowerCheckAt !== undefined && at - lastPowerCheckAt < POWER_CHECK_MS) return
+  lastPowerCheckAt = at
+  const onBattery = await $.process
+    .run(POWER_SOURCE_PROBE, { timeoutMs: 5000 })
+    .then(r => parsePowerSource(r.stdout))
+    .catch(() => null)
+  await updateStats($, s => {
+    if (onBattery === s.isOnBattery) return s
+    if (onBattery) return { ...s, isOnBattery: true, batteryJoules: 0, batterySince: at }
+    return { ...s, isOnBattery: onBattery }
+  })
 }
 
 async function sampleNet($: EngineInterface, pids: readonly number[]) {
@@ -277,13 +343,15 @@ export const register: Register = on => {
       name: 'session-stats',
       description:
         'Show live CPU, RAM and processes of this session; "bar" toggles the strip above the prompt, "mode" sets how much the monitor itself costs, "stop" shuts everything off',
-      argumentHint: '[bar [on|off] | mode [lite|normal|full] | stop]',
+      argumentHint: '[bar [on|off|prompt [on|off]] | mode [lite|normal|full] | stop]',
     })
     const isOn = (await $.store.get(BAR_KEY)) === true
     await update($, isBarOn, () => isOn)
     const stored = await $.store.get(MODE_KEY)
     mode = stored === 'normal' || stored === 'full' ? stored : 'lite'
     await update($, modeAtom, () => mode)
+    const isPromptOn = (await $.store.get(BAR_PROMPT_KEY)) === true
+    await update($, isBarPromptOn, () => isPromptOn)
     const batteryWh = await $.process
       .run(BATTERY_PROBE, { timeoutMs: 5000 })
       .then(r => parseBattery(r.stdout))
@@ -320,8 +388,12 @@ export const register: Register = on => {
       const done = { ...turn, seconds: ((await $.clock.now()) - turn.startedAt) / 1000 }
       await updateStats($, s => ({ ...s, turn: null, lastTurn: done }))
       if (done.joules >= TOAST_JOULES) {
-        const battery = batteryWh ? `, ${batteryShare(done.joules, batteryWh)} of your battery` : ''
-        $.ui.toast(`That prompt used ${joules(done.joules)}${battery} (peak ${(done.peakCpu / 100).toFixed(1)} cores)`)
+        const peak = `peak ${(done.peakCpu / 100).toFixed(1)} cores`
+        $.ui.toast(
+          batteryWh
+            ? `That prompt used ${batteryShare(done.joules, batteryWh)} of your battery (${joules(done.joules)}, ${peak})`
+            : `That prompt used ${joules(done.joules)} (${peak})`,
+        )
       }
     }
     await syncSampler($)
@@ -342,6 +414,13 @@ export const register: Register = on => {
       return { text: `Session stats mode ${mode}: ${MODES[mode].note}.` }
     }
     if (sub !== 'bar') return { text: await openPane($) }
+    if (arg === 'prompt') {
+      const choice = e.args.trim().split(/\s+/)[2]
+      const isOn = choice === 'on' ? true : choice === 'off' ? false : !(await read($, isBarPromptOn))
+      await $.store.set(BAR_PROMPT_KEY, isOn)
+      await update($, isBarPromptOn, () => isOn)
+      return { text: `Prompt energy on the bar ${isOn ? 'on' : 'off'}.` }
+    }
 
     const isOn = arg === 'on' ? true : arg === 'off' ? false : !(await read($, isBarOn))
     await $.store.set(BAR_KEY, isOn)
@@ -364,13 +443,24 @@ export const register: Register = on => {
     lastBarDrawnAt = await $.clock.now()
 
     const { Button, Text } = $.ui.resolve(e)
-    const { snapshot: s, cpuHistory, ramHistory, turn, lastTurn } = await readStats($)
+    const st = await readStats($)
+    const { snapshot: s, cpuHistory, ramHistory, turn, lastTurn, io } = st
     const width = e.props.bodyColumns ?? e.viewport?.columns ?? 80
-    // The prompt's energy: the one running, else the last one
-    const shown = turn ?? lastTurn
-    const prompt = shown ? `  ⚡ ${joules(shown.joules)} ${turn ? 'now' : 'last'}` : ''
+    // Power now, then the battery this session used since the last unplug
+    const power = `  ⚡ ${io?.hasEnergy ? watts(io.watts) : '…'}`
+    const battery =
+      st.isOnBattery && st.batteryWh
+        ? `  🔋 ${batteryShare(st.batteryJoules, st.batteryWh)} used`
+        : st.isOnBattery === false
+          ? '  🔌'
+          : ''
+    // Optional: the prompt's energy, the one running or else the last one
+    const shown = (await read($, isBarPromptOn)) ? (turn ?? lastTurn) : null
+    const prompt = shown ? `  ${joules(shown.joules)} ${turn ? 'now' : 'last'}` : ''
+    // Emoji draw two cells wide: one more each than their length counts
+    const extra = power.length + battery.length + prompt.length + (battery ? 2 : 1)
     // "⚙ CPU 100% " + " " + " RAM 10.0G " + " " is 26 cells around the two histories
-    const span = Math.max(6, Math.min(BAR_SPAN, Math.floor((width - 26 - prompt.length) / 2)))
+    const span = Math.max(6, Math.min(BAR_SPAN, Math.floor((width - 26 - extra) / 2)))
     const cpu = sparkline(cpuHistory.slice(-span))
     const ram = sparkline(ramHistory.slice(-span))
 
@@ -383,6 +473,8 @@ export const register: Register = on => {
         <Text color={ramColor(s?.rssKb ?? 0)}>{(s ? `${gb(s.rssKb)}G` : '…').padStart(5)} </Text>
         <Text color="magenta">{ram}</Text>
         <Text dimColor>{'·'.repeat(span - ram.length)}</Text>
+        <Text color={io?.hasEnergy ? wattsColor(io.watts) : undefined} dimColor={!io?.hasEnergy}>{power}</Text>
+        {battery && <Text color={st.isOnBattery ? batteryColor(st.batteryJoules, st.batteryWh) : undefined} dimColor={!st.isOnBattery}>{battery}</Text>}
         {shown && <Text color={joulesColor(shown.joules)}>{prompt}</Text>}
       </Button>
     )
@@ -432,8 +524,8 @@ export const register: Register = on => {
         <Text color="yellow">{sparkline(diskHistory.slice(-spark))}</Text>
         <Text>
           <Text bold>ENERGY </Text>
-          {io?.hasEnergy ? `${io.watts.toFixed(2)} W` : <Text dimColor>{io ? 'needs macOS 13 or later' : noRusage ?? 'measuring…'}</Text>}
-          {io?.hasEnergy && <Text dimColor> ({io.joules.toFixed(0)} J since sampling began)</Text>}
+          {io?.hasEnergy ? `${watts(io.watts)} now` : <Text dimColor>{io ? 'needs macOS 13 or later' : noRusage ?? 'measuring…'}</Text>}
+          <Text dimColor> · {batterySummary(st)}</Text>
         </Text>
         <Text color="red">{sparkline(energyHistory.slice(-spark))}</Text>
         <Text>

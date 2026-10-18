@@ -12,13 +12,14 @@ Type `/session-stats` and a pane opens with:
 
 - CPU and RAM for the session's whole process tree (the `claude` process plus every
   shell, build, test runner and stdio MCP server it started), with sparklines of up to the last 4 minutes
-- network (down and up), disk (read and write) and energy (watts, and joules since
-  sampling began) for the same tree, each with its own sparkline
+- network (down and up), disk (read and write) and energy (watts now, and the share of
+  the battery this session used since you unplugged) for the same tree, each with its
+  own sparkline
 - the session's share of your cores and memory, process count, uptime and load average
 - a process table, indented as a tree, busiest first, with each process's power draw
-- **PROMPT**: the running or last prompt's duration, energy, share of your battery,
+- **PROMPT**: the running or last prompt's duration, share of your battery (and joules),
   CPU-seconds and peak cores. A prompt that uses 300 J or more raises a toast, such as
-  "That prompt used 1.2 kJ, 0.5% of your battery (peak 6.1 cores)"
+  "That prompt used 0.5% of your battery (1.2 kJ, peak 6.1 cores)"
 - **ALL CLAUDE**: every Claude process tree on the machine (all your windows and
   background sessions) totalled: watts, CPU, RAM, and this session's share of the power
 - the monitor's own cost, so you can see what watching costs
@@ -31,8 +32,18 @@ It samples while the pane, the bar or a prompt needs it, at the rate the mode se
 
 ![The session-stats bar above the prompt: CPU and RAM numbers, each followed by a sparkline](docs/bar.png)
 
-After the histories the strip shows the prompt's energy: `⚡ 120 J now` while one
-runs, `⚡ 1.2 kJ last` after. Each history is up to 30 cells wide (one minute) from the start and fills left to
+After the histories the strip shows the session's power draw right now, then how much
+of the battery this session has used since you last unplugged:
+
+```
+⚡ 0.42 W  🔋 0.31% used        (on battery)
+⚡ 0.42 W  🔌                   (on AC power)
+```
+
+The battery count covers this session's processes while on battery; plugging in pauses
+it and the next unplug starts it over. A session that starts on battery counts from
+then. `/session-stats bar prompt on` also shows each prompt's energy in joules
+(`120 J now` while one runs, `1.2 kJ last` after). Each history is up to 30 cells wide (one minute) from the start and fills left to
 right, then scrolls. Click the strip to open the full pane. The setting is remembered across sessions;
 `/session-stats bar on` and `/session-stats bar off` set it directly.
 
@@ -43,7 +54,7 @@ The bar is meant to stay on, so the monitor's own cost is yours to set with
 
 | Mode | Samples | Shows on the bar | Monitor's own cost |
 | --- | --- | --- | --- |
-| `lite` (default) | every 10 s, one cheap `ps` | CPU, RAM, prompt energy | about 0.4% of one core |
+| `lite` (default) | every 10 s, one cheap `ps` and the energy probe | CPU, RAM, power, battery used | about 1% of one core |
 | `normal` | every 5 s, plus the energy probe | the same, with live energy and disk for the pane | about 3% |
 | `full` | every 2 s, everything | the same, at the finest resolution | about 7% |
 
